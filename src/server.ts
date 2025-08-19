@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express";
 import { request } from "undici";
-import * as zlib from "zlib";
+import * as zlib from "node:zlib";
 import { parse as parseUrlLegacy } from "node:url";
 import { URL } from "node:url";
 import { parse as parseQuery } from "node:querystring";
