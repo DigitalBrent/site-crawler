@@ -201,7 +201,7 @@ const SKIP_PATH_PATTERNS: RegExp[] = [
   /^\/author(?:\/|$)/i,
 
   // Search pages
-  /^\/search(?:\/|$)/i
+  /^\/search(?:\/|$)/i,
 
   // Custom exclusions
   /^\/wpa-stats-type(?:\/|$)/i,   // exclude /wpa-stats-type/
