@@ -718,32 +718,23 @@ async function crawlSite(
   }
 
   // Prepare rows
-  const rows: Row[] = [];
-  const discoveredAt = new Date().toISOString();
-  for (const [key, info] of pageMap) {
-    const via = info.discoveredVia;
-    let dv: Row["discovered_via"] = "crawl";
-    if (via.has("sitemap") && via.has("crawl")) dv = "both";
-    else if (via.has("sitemap")) dv = "sitemap";
-    else if (via.has("guess")) dv = "guess";
+const rows: Row[] = [];
+for (const [key, info] of pageMap) {
+  // Orphan = present in sitemap set but never found by internal links (in-degree 0)
+  const isOrphan = info.discoveredVia.has("sitemap") && (inbound.get(key) || 0) === 0;
 
-    // Orphan = present in sitemap set but never found by internal links (in-degree 0)
-    const isOrphan = via.has("sitemap") && (inbound.get(key) || 0) === 0;
+  rows.push({
+    url: info.url,
+    path: new URL(info.url).pathname || "/",
+    title: info.title ?? null,
+    inbound_count: inbound.get(key) || 0,
+    is_orphan: isOrphan,
+    noindex: !!info.noindex,
+    nofollow: !!info.nofollow
+  });
+}
 
-    // parent_urls flattened
-    const parentUrls = Array.from(info.parents.values()).join(";");
-
-    rows.push({
-      url: info.url,
-      path: new URL(info.url).pathname || "/",
-      title: info.title ?? null,
-      is_orphan: isOrphan,
-      noindex: !!info.noindex,
-      nofollow: !!info.nofollow
-    });
-  }
-
-  return rows;
+return rows;
 }
 
 // -------------------------------
