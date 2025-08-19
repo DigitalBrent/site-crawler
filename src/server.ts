@@ -250,7 +250,7 @@ async function httpGet(
       if (vv) headers[k.toLowerCase()] = vv;
     }
     const arrayBuf = await res.body.arrayBuffer();
-    let body = Buffer.from(arrayBuf);
+    let body: Buffer = Buffer.from(arrayBuf as ArrayBuffer);
 
     // Transparently handle gzip/deflate if server didn't
     const ce = headers["content-encoding"];
