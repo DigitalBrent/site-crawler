@@ -1,5 +1,5 @@
 {
-  "name": "automartian-crawler",
+  "name": "Site Scanner",
   "version": "1.0.0",
   "type": "module",
   "main": "dist/server.js",
