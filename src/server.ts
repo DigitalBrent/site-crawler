@@ -1,9 +1,8 @@
+// src/server.ts
 import express, { Request, Response } from "express";
 import { request } from "undici";
 import * as zlib from "node:zlib";
-import { parse as parseUrlLegacy } from "node:url";
 import { URL } from "node:url";
-import { parse as parseQuery } from "node:querystring";
 import { XMLParser } from "fast-xml-parser";
 import pLimit from "p-limit";
 import { createHash } from "node:crypto";
@@ -23,7 +22,7 @@ type CrawlOptions = {
   concurrency?: number;
   pageTimeoutMs?: number;
   userAgent?: string;
-  chunk?: boolean; // not used in this initial drop; response is one array
+  chunk?: boolean;
   flattenForSheets?: boolean;
   guessCommonSlugs?: boolean;
 };
@@ -48,7 +47,7 @@ type PageInfo = {
   noindex?: boolean;
   nofollow?: boolean;
   canonical?: string | null;
-  lastmod?: string | null; // from sitemap
+  lastmod?: string | null;
   sourceSitemaps?: Set<string>;
 };
 
@@ -80,10 +79,9 @@ function isPrivateIp(ip: string): boolean {
     if (parts[0] === 192 && parts[1] === 168) return true;
     if (parts[0] === 127) return true;
   } else if (net.isIP(ip) === 6) {
-    // Basic checks for localhost/link-local/unique-local
     if (ip === "::1") return true;
-    if (ip.startsWith("fe80:")) return true; // link-local
-    if (ip.startsWith("fd") || ip.startsWith("fc")) return true; // unique local
+    if (ip.startsWith("fe80:")) return true;
+    if (ip.startsWith("fd") || ip.startsWith("fc")) return true;
   }
   return false;
 }
@@ -97,7 +95,6 @@ async function assertNotSSRF(hostname: string) {
       }
     }
   } catch (e: any) {
-    // If DNS fails, allow HTTP to decide; only block if private.
     if (String(e?.message || "").includes("private IP")) throw e;
   }
 }
@@ -116,21 +113,15 @@ function stripTrackingParams(u: URL) {
 function normalizeInputUrl(raw: string): string {
   let s = raw.trim();
   if (!/^https?:\/\//i.test(s)) {
-    // Default to https
     s = "https://" + s.replace(/^\/+/, "");
   }
-  // Remove fragments
   const u = new URL(s);
   u.hash = "";
-  // Force root path for seed normalization
-  // (We'll separately keep a "home" URL to start at root)
   if (!u.pathname || u.pathname === "/" || u.pathname === "") {
     u.pathname = "/";
   }
   stripTrackingParams(u);
-  // Lowercase host, strip default ports
   u.host = u.hostname.toLowerCase() + (u.port ? `:${u.port}` : "");
-  // Remove trailing slash duplication
   if (!u.search && u.pathname !== "/") {
     u.pathname = u.pathname.replace(/\/+$/, "") || "/";
   }
@@ -140,7 +131,6 @@ function normalizeInputUrl(raw: string): string {
 function siteRootFromAny(raw: string): { https: string; http: string; host: string } {
   const n = normalizeInputUrl(raw);
   const u = new URL(n);
-  // Collapse to root path
   u.pathname = "/";
   u.search = "";
   const https = "https://" + u.host + "/";
@@ -158,14 +148,13 @@ function sameHost(target: URL, baseHost: string, includeSubdomains: boolean): bo
 
 function isLikelyHtml(u: URL): boolean {
   const path = u.pathname.toLowerCase();
-  // Skip non-HTML by extension
   if (/\.(pdf|zip|rar|7z|gz|tar|jpg|jpeg|png|gif|webp|svg|mp4|avi|mov|wmv|mkv|mp3|wav|ogg|webm|woff2?|ttf|otf|eot|css|js|json)$/i.test(path)) {
     return false;
   }
   return true;
 }
 
-// Skip paths: admin/system + WP taxonomy + search
+// Skip paths: admin/system + WP taxonomy + search + custom
 const SKIP_PATH_PATTERNS: RegExp[] = [
   /^\/wp-admin(?:\/|$)/i,
   /^\/wp-login(?:\/|$)/i,
@@ -183,19 +172,19 @@ const SKIP_PATH_PATTERNS: RegExp[] = [
   /^\/drupal(?:\/|$)/i,
   /^\/ghost(?:\/|$)/i,
   /^\/server-status(?:\/|$)/i,
-  /^\/[^/]+\.php$/i, // root-level php files
+  /^\/[^/]+\.php$/i,
 
-  // WordPress taxonomy archives
+  // WordPress taxonomy
   /^\/tag(?:\/|$)/i,
   /^\/category(?:\/|$)/i,
   /^\/author(?:\/|$)/i,
 
-  // Search pages
+  // Search
   /^\/search(?:\/|$)/i,
 
   // Custom exclusions
-  /^\/wpa-stats-type(?:\/|$)/i,   // exclude /wpa-stats-type/
-  /\.kml(?:\?|$)/i                // exclude *.kml
+  /^\/wpa-stats-type(?:\/|$)/i,
+  /\.kml$/i // exclude .kml files by pathname
 ];
 
 function shouldSkipPath(u: URL): boolean {
@@ -210,7 +199,6 @@ function shouldSkipPath(u: URL): boolean {
 }
 
 function canonicalKey(u: URL): string {
-  // Normalize: strip fragments (already), strip tracking params; lower host; keep path and query
   const copy = new URL(u.toString());
   copy.hash = "";
   stripTrackingParams(copy);
@@ -246,12 +234,10 @@ async function httpGet(
     const arrayBuf = await res.body.arrayBuffer();
     let body: Buffer = Buffer.from(arrayBuf as ArrayBuffer);
 
-    // Transparently handle gzip/deflate if server didn't
     const ce = headers["content-encoding"];
     if (ce === "gzip") body = zlib.gunzipSync(body);
     else if (ce === "deflate") body = zlib.inflateSync(body);
 
-    // Cap body size to ~2MB
     const MAX = 2 * 1024 * 1024;
     if (body.length > MAX) body = body.subarray(0, MAX);
 
@@ -295,14 +281,12 @@ async function discoverSitemaps(rootUrl: string, ua: string, timeoutMs: number):
   const host = `${base.protocol}//${base.host}`;
   const candidates = new Set<string>();
 
-  // robots.txt
   const robotsUrl = `${host}/robots.txt`;
   const robots = await tryFetchText(robotsUrl, ua, timeoutMs);
   if (robots) {
     for (const s of parseRobotsForSitemaps(robots)) candidates.add(s);
   }
 
-  // Common fallbacks
   ["/sitemap.xml", "/sitemap_index.xml", "/sitemap.xml.gz", "/sitemap_index.xml.gz"].forEach(p =>
     candidates.add(host + p)
   );
@@ -320,7 +304,6 @@ function parseXmlSitemap(xml: string): { urls: { loc: string; lastmod?: string }
   const urls: { loc: string; lastmod?: string }[] = [];
   const nested: string[] = [];
 
-  // urlset -> url[]
   if (j.urlset?.url) {
     const items = Array.isArray(j.urlset.url) ? j.urlset.url : [j.urlset.url];
     for (const it of items) {
@@ -328,7 +311,6 @@ function parseXmlSitemap(xml: string): { urls: { loc: string; lastmod?: string }
     }
   }
 
-  // sitemapindex -> sitemap[]
   if (j.sitemapindex?.sitemap) {
     const items = Array.isArray(j.sitemapindex.sitemap) ? j.sitemapindex.sitemap : [j.sitemapindex.sitemap];
     for (const it of items) {
@@ -414,7 +396,6 @@ async function harvestSitemaps(
     }
   }
 
-  // Ensure root is present
   try {
     const u = new URL(root);
     const key = canonicalKey(u);
@@ -440,7 +421,6 @@ async function harvestSitemaps(
 }
 
 function extractMetaRobots(content: string): { noindex: boolean; nofollow: boolean } {
-  // meta name="robots" content="noindex,nofollow"
   const m = content.toLowerCase();
   const noindex = /\bnoindex\b/.test(m);
   const nofollow = /\bnofollow\b/.test(m);
@@ -454,7 +434,6 @@ function getTitleFromHtml(html: string): string | null {
 }
 
 function decodeHTMLEntities(s: string): string {
-  // Minimal decoding
   return s
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -478,7 +457,6 @@ function getCanonicalFromHtml(html: string, baseUrl: URL): string | null {
 }
 
 function extractMetaRobotsFromHtml(html: string): { noindex: boolean; nofollow: boolean } {
-  // Allow multiple tags; merge
   let noindex = false, nofollow = false;
   const tags = html.match(/<meta\s+[^>]*name=["']robots["'][^>]*>/ig) || [];
   for (const tag of tags) {
@@ -503,17 +481,13 @@ async function crawlSite(
 ): Promise<Row[]> {
   await assertNotSSRF(baseHost);
 
-  // 1) Harvest sitemaps
-  const { pages: sitemapPages, usedSitemaps } = await harvestSitemaps(seedRoot, baseHost, includeSubdomains, opts.userAgent, opts.pageTimeoutMs);
+  const { pages: sitemapPages } = await harvestSitemaps(seedRoot, baseHost, includeSubdomains, opts.userAgent, opts.pageTimeoutMs);
 
-  // 2) BFS crawl; seed frontier with home + sitemap URLs
   const frontier: { url: URL; depth: number; parent?: string }[] = [];
   const seenKeys = new Set<string>();
   const pageMap: Map<string, PageInfo> = new Map(sitemapPages);
 
-  // Ensure both https and http attempt for home, trying https first
   const homeHttps = new URL(seedRoot);
-  const homeHttp = new URL(seedRoot.replace(/^https:/, "http:"));
 
   frontier.push({ url: homeHttps, depth: 0 });
   const sitemapList = Array.from(sitemapPages.values());
@@ -530,21 +504,18 @@ async function crawlSite(
   async function handlePage(target: URL, depth: number, parent?: string) {
     if (depth > opts.maxDepth) return;
 
-    // Host check
     if (!sameHost(target, baseHost, includeSubdomains)) return;
     if (!isLikelyHtml(target)) return;
     if (shouldSkipPath(target)) return;
 
     const key = canonicalKey(target);
     if (seenKeys.has(key)) {
-      // add parent linkage if known
       const info = pageMap.get(key);
       if (info && parent) info.parents.add(parent);
       return;
     }
     seenKeys.add(key);
 
-    // Initialize page info
     const info: PageInfo = pageMap.get(key) ?? {
       url: target.toString(),
       depth,
@@ -564,19 +535,16 @@ async function crawlSite(
     info.depth = Math.min(info.depth ?? depth, depth);
     pageMap.set(key, info);
 
-    // request
     let finalUrl = target;
     let res;
     try {
       res = await httpGet(finalUrl.toString(), opts.userAgent, opts.pageTimeoutMs);
       if (res.status >= 400 && finalUrl.protocol === "https:") {
-        // quick fallback to http if https fails badly
         const alt = new URL(finalUrl.toString().replace(/^https:/, "http:"));
         res = await httpGet(alt.toString(), opts.userAgent, opts.pageTimeoutMs);
         finalUrl = alt;
       }
     } catch {
-      // mark unreachable
       info.status = 0;
       return;
     }
@@ -585,24 +553,20 @@ async function crawlSite(
 
     const ctype = info.contentType || "";
     if (!/text\/html|application\/xhtml\+xml/i.test(ctype)) {
-      return; // non-HTML: do not parse or enqueue
+      return;
     }
 
     const html = res.body.toString("utf8");
 
-    // Title
     info.title = getTitleFromHtml(html);
 
-    // Canonical
     const canon = getCanonicalFromHtml(html, finalUrl);
     if (canon) {
       try {
         const cu = new URL(canon, finalUrl);
-        // Re-key to canonical if same-host & viable
         if (sameHost(cu, baseHost, includeSubdomains) && isLikelyHtml(cu) && !shouldSkipPath(cu)) {
           info.canonical = cu.toString();
           const ck = canonicalKey(cu);
-          // Merge info under canonical key
           if (ck !== key) {
             const existing = pageMap.get(ck) ?? {
               url: cu.toString(),
@@ -618,7 +582,6 @@ async function crawlSite(
               lastmod: info.lastmod,
               sourceSitemaps: new Set<string>()
             };
-            // merge fields
             existing.parents = new Set<string>([...existing.parents, ...info.parents]);
             info.discoveredVia.forEach(d => existing.discoveredVia.add(d));
             if (info.title && !existing.title) existing.title = info.title;
@@ -634,13 +597,10 @@ async function crawlSite(
       } catch { /* ignore bad canonical */ }
     }
 
-    // Robots meta
     const meta = extractMetaRobotsFromHtml(html);
     info.noindex = !!meta.noindex;
     info.nofollow = !!meta.nofollow;
 
-    // Extract links
-    // Lightweight anchor extraction to avoid full Cheerio cost on huge pages
     const hrefs: string[] = [];
     const anchorRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>/ig;
     let m: RegExpExecArray | null;
@@ -677,64 +637,28 @@ async function crawlSite(
     );
   }
 
-  // Optional guesser pass for super-common slugs (disabled by default)
-  // (Keeps it lightweight and bounded)
-  if (DEFAULTS.guessCommonSlugs) {
-    const common = ["/privacy", "/terms", "/about", "/contact", "/rss", "/feed", "/sitemap", "/robots"];
-    const root = new URL(seedRoot);
-    for (const slug of common) {
-      const u = new URL(slug, `${root.protocol}//${root.host}`);
-      if (!sameHost(u, baseHost, includeSubdomains)) continue;
-      if (shouldSkipPath(u)) continue;
-      const key = canonicalKey(u);
-      if (pageMap.has(key)) continue;
-      try {
-        const res = await httpGet(u.toString(), opts.userAgent, opts.pageTimeoutMs);
-        if (res.status >= 200 && res.status < 400) {
-          const info: PageInfo = {
-            url: u.toString(),
-            depth: 1,
-            parents: new Set<string>(),
-            discoveredVia: new Set<"sitemap" | "crawl" | "guess">(["guess"]),
-            status: res.status,
-            contentType: res.headers["content-type"] || null,
-            title: getTitleFromHtml(res.body.toString("utf8")),
-            noindex: false,
-            nofollow: false,
-            canonical: null,
-            lastmod: undefined,
-            sourceSitemaps: new Set<string>()
-          };
-          pageMap.set(key, info);
-        }
-      } catch { /* ignore */ }
-    }
-  }
-
-  // Compute inbound counts and orphan flags
+  // Compute inbound counts (for orphan calc)
   const inbound = new Map<string, number>();
   for (const [key, info] of pageMap) {
     inbound.set(key, info.parents.size);
   }
 
-  // Prepare rows
-const rows: Row[] = [];
-for (const [key, info] of pageMap) {
-  // Orphan = present in sitemap set but never found by internal links (in-degree 0)
-  const isOrphan = info.discoveredVia.has("sitemap") && (inbound.get(key) || 0) === 0;
+  // Prepare rows (slimmed)
+  const rows: Row[] = [];
+  for (const [key, info] of pageMap) {
+    const isOrphan = info.discoveredVia.has("sitemap") && (inbound.get(key) || 0) === 0;
 
-  rows.push({
-    url: info.url,
-    path: new URL(info.url).pathname || "/",
-    title: info.title ?? null,
-    inbound_count: inbound.get(key) || 0,
-    is_orphan: isOrphan,
-    noindex: !!info.noindex,
-    nofollow: !!info.nofollow
-  });
-}
+    rows.push({
+      url: info.url,
+      path: new URL(info.url).pathname || "/",
+      title: info.title ?? null,
+      is_orphan: isOrphan,
+      noindex: !!info.noindex,
+      nofollow: !!info.nofollow
+    });
+  }
 
-return rows;
+  return rows;
 }
 
 // -------------------------------
@@ -746,24 +670,20 @@ app.post("/crawl", async (req: Request, res: Response) => {
 
   const o: CrawlOptions = { ...DEFAULTS, ...(req.body?.options || {}) };
 
-  let seedHttps: string, seedHttp: string, host: string;
+  let seedHttps: string, host: string;
   try {
     const root = siteRootFromAny(rawUrl);
     seedHttps = root.https;
-    seedHttp = root.http;
     host = root.host;
-  } catch (e: any) {
+  } catch {
     return res.status(400).json({ error: "Invalid URL" });
   }
 
   try {
-    // Prefer HTTPS seed; if it fails immediately, fallback to HTTP by swapping protocol within crawl
     const rows = await crawlSite(seedHttps, host, !!o.includeSubdomains, {
       ...DEFAULTS,
       ...o
     });
-
-    // Sheets-friendly: root-level array of objects
     return res.status(200).json(rows);
   } catch (e: any) {
     return res.status(500).json({ error: String(e?.message || e) });
