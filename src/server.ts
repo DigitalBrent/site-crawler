@@ -31,20 +31,11 @@ type CrawlOptions = {
 type Row = {
   url: string;
   path: string;
-  depth: number;
-  status_code: number | null;
-  content_type: string | null;
   title: string | null;
-  discovered_via: "sitemap" | "crawl" | "both" | "guess";
-  parent_urls: string;
   inbound_count: number;
   is_orphan: boolean;
   noindex: boolean;
   nofollow: boolean;
-  lastmod: string | null;
-  source_sitemaps: string;
-  canonical_url: string | null;
-  discovered_at: string;
 };
 
 type PageInfo = {
@@ -746,20 +737,11 @@ async function crawlSite(
     rows.push({
       url: info.url,
       path: new URL(info.url).pathname || "/",
-      depth: info.depth ?? 0,
-      status_code: info.status ?? null,
-      content_type: info.contentType ?? null,
       title: info.title ?? null,
-      discovered_via: dv,
-      parent_urls: parentUrls,
       inbound_count: inbound.get(key) || 0,
       is_orphan: isOrphan,
       noindex: !!info.noindex,
-      nofollow: !!info.nofollow,
-      lastmod: info.lastmod ?? null,
-      source_sitemaps: info.sourceSitemaps ? Array.from(info.sourceSitemaps).join(";") : "",
-      canonical_url: info.canonical ?? null,
-      discovered_at: discoveredAt
+      nofollow: !!info.nofollow
     });
   }
 
