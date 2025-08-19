@@ -202,6 +202,10 @@ const SKIP_PATH_PATTERNS: RegExp[] = [
 
   // Search pages
   /^\/search(?:\/|$)/i
+
+  // Custom exclusions
+  /^\/wpa-stats-type(?:\/|$)/i,   // exclude /wpa-stats-type/
+  /\.kml(?:\?|$)/i                // exclude *.kml
 ];
 
 function shouldSkipPath(u: URL): boolean {
