@@ -32,7 +32,6 @@ type Row = {
   url: string;
   path: string;
   title: string | null;
-  inbound_count: number;
   is_orphan: boolean;
   noindex: boolean;
   nofollow: boolean;
@@ -738,7 +737,6 @@ async function crawlSite(
       url: info.url,
       path: new URL(info.url).pathname || "/",
       title: info.title ?? null,
-      inbound_count: inbound.get(key) || 0,
       is_orphan: isOrphan,
       noindex: !!info.noindex,
       nofollow: !!info.nofollow
