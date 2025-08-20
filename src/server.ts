@@ -410,6 +410,85 @@ async function harvestSitemaps(
   return { pages, usedSitemaps };
 }
 
+function normalizeForGrouping(path: string): string {
+  let p = path || "/";
+  // Ensure leading slash
+  if (!p.startsWith("/")) p = "/" + p;
+  // Collapse multiple slashes
+  p = p.replace(/\/{2,}/g, "/");
+  // Remove trailing slash (except root)
+  if (p.length > 1) p = p.replace(/\/+$/, "");
+  // Treat /index and /index.html as the parent folder
+  p = p.replace(/\/index(?:\.html?)?$/i, "");
+  if (p === "") p = "/";
+  return p;
+}
+
+function parentOf(path: string): string | null {
+  const p = normalizeForGrouping(path);
+  if (p === "/") return null;
+  const i = p.lastIndexOf("/");
+  return i <= 0 ? "/" : p.slice(0, i) || "/";
+}
+
+function hierarchicalOrder(rows: Row[]): Row[] {
+  // Map normalized path -> Row
+  const byPath = new Map<string, Row>();
+  // Parent -> set of child paths (normalized)
+  const children = new Map<string, Set<string>>();
+  const all = new Set<string>();
+
+  for (const r of rows) {
+    const np = normalizeForGrouping(r.path);
+    all.add(np);
+    byPath.set(np, r);
+    const parent = parentOf(np);
+    if (parent) {
+      if (!children.has(parent)) children.set(parent, new Set());
+      children.get(parent)!.add(np);
+    }
+  }
+
+  // Roots are paths whose parent doesn't exist as a row
+  const roots: string[] = [];
+  for (const p of all) {
+    const par = parentOf(p);
+    if (!par || !byPath.has(par)) roots.push(p);
+  }
+
+  const cmp = (a: string, b: string) => a.localeCompare(b, undefined, { sensitivity: "base" });
+
+  const result: Row[] = [];
+  const visited = new Set<string>();
+
+  function visit(p: string) {
+    if (visited.has(p)) return;
+    visited.add(p);
+
+    // Emit this row if it exists (we never invent rows)
+    const row = byPath.get(p);
+    if (row) result.push(row);
+
+    // Then its immediate children, alphabetically
+    const kids = Array.from(children.get(p) || []).sort(cmp);
+    for (const k of kids) visit(k);
+  }
+
+  // Prefer visiting "/" first if present, then other roots
+  roots.sort(cmp);
+  if (byPath.has("/")) {
+    visit("/");
+    for (const r of roots) if (r !== "/") visit(r);
+  } else {
+    for (const r of roots) visit(r);
+  }
+
+  // Safety: visit any unvisited nodes (in case of oddities)
+  for (const p of all) if (!visited.has(p)) visit(p);
+
+  return result;
+}
+
 // -------------------------------
 // Crawl
 // -------------------------------
@@ -568,15 +647,16 @@ async function crawlSite(
   }
 
   // Prepare rows (only url + path)
-  const rows: Row[] = [];
-  for (const [, info] of pageMap) {
-    rows.push({
-      url: info.url,
-      path: new URL(info.url).pathname || "/"
-    });
-  }
+const rows: Row[] = [];
+for (const [, info] of pageMap) {
+  rows.push({
+    url: info.url,
+    path: new URL(info.url).pathname || "/"
+  });
+}
 
-  return rows;
+// NEW: order parent-first, then children
+return hierarchicalOrder(rows);
 }
 
 function getCanonicalFromHtml(html: string, baseUrl: URL): string | null {
