@@ -1,3 +1,4 @@
+// src/server.ts
 import express, { Request, Response } from "express";
 import { request } from "undici";
 import * as zlib from "node:zlib";
@@ -25,9 +26,9 @@ type CrawlOptions = {
   guessCommonSlugs?: boolean;
 };
 
+// Final row returned to Sheets: only one column
 type Row = {
-  url: string;
-  path: string;
+  path: string; // a Google Sheets HYPERLINK() formula whose display text is the relative path
 };
 
 type PageInfo = {
@@ -37,9 +38,9 @@ type PageInfo = {
   discoveredVia: Set<"sitemap" | "crawl" | "guess">;
   status?: number;
   contentType?: string | null;
-  title?: string | null;          // kept in type (not used in output)
-  noindex?: boolean;              // kept in type (not used in output)
-  nofollow?: boolean;             // kept in type (not used in output)
+  title?: string | null;
+  noindex?: boolean;
+  nofollow?: boolean;
   canonical?: string | null;
   lastmod?: string | null;
   sourceSitemaps?: Set<string>;
@@ -410,15 +411,28 @@ async function harvestSitemaps(
   return { pages, usedSitemaps };
 }
 
+function getCanonicalFromHtml(html: string, baseUrl: URL): string | null {
+  const m = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*>/i);
+  if (!m) return null;
+  const tag = m[0];
+  const hrefM = tag.match(/\shref=["']([^"']+)["']/i);
+  if (!hrefM) return null;
+  try {
+    const u = new URL(hrefM[1], baseUrl);
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+// ---------- Sorting & hyperlink helpers ----------
+type InternalRow = { url: string; path: string };
+
 function normalizeForGrouping(path: string): string {
   let p = path || "/";
-  // Ensure leading slash
   if (!p.startsWith("/")) p = "/" + p;
-  // Collapse multiple slashes
   p = p.replace(/\/{2,}/g, "/");
-  // Remove trailing slash (except root)
   if (p.length > 1) p = p.replace(/\/+$/, "");
-  // Treat /index and /index.html as the parent folder
   p = p.replace(/\/index(?:\.html?)?$/i, "");
   if (p === "") p = "/";
   return p;
@@ -431,10 +445,8 @@ function parentOf(path: string): string | null {
   return i <= 0 ? "/" : p.slice(0, i) || "/";
 }
 
-function hierarchicalOrder(rows: Row[]): Row[] {
-  // Map normalized path -> Row
-  const byPath = new Map<string, Row>();
-  // Parent -> set of child paths (normalized)
+function hierarchicalOrder<T extends { path: string }>(rows: T[]): T[] {
+  const byPath = new Map<string, T>();
   const children = new Map<string, Set<string>>();
   const all = new Set<string>();
 
@@ -449,7 +461,6 @@ function hierarchicalOrder(rows: Row[]): Row[] {
     }
   }
 
-  // Roots are paths whose parent doesn't exist as a row
   const roots: string[] = [];
   for (const p of all) {
     const par = parentOf(p);
@@ -458,23 +469,18 @@ function hierarchicalOrder(rows: Row[]): Row[] {
 
   const cmp = (a: string, b: string) => a.localeCompare(b, undefined, { sensitivity: "base" });
 
-  const result: Row[] = [];
+  const result: T[] = [];
   const visited = new Set<string>();
 
   function visit(p: string) {
     if (visited.has(p)) return;
     visited.add(p);
-
-    // Emit this row if it exists (we never invent rows)
     const row = byPath.get(p);
     if (row) result.push(row);
-
-    // Then its immediate children, alphabetically
     const kids = Array.from(children.get(p) || []).sort(cmp);
     for (const k of kids) visit(k);
   }
 
-  // Prefer visiting "/" first if present, then other roots
   roots.sort(cmp);
   if (byPath.has("/")) {
     visit("/");
@@ -482,11 +488,14 @@ function hierarchicalOrder(rows: Row[]): Row[] {
   } else {
     for (const r of roots) visit(r);
   }
-
-  // Safety: visit any unvisited nodes (in case of oddities)
   for (const p of all) if (!visited.has(p)) visit(p);
-
   return result;
+}
+
+function hyperlinkFormula(origin: string, path: string): string {
+  const abs = new URL(path, origin).toString();
+  const esc = (s: string) => s.replace(/"/g, '""');
+  return `=HYPERLINK("${esc(abs)}","${esc(path)}")`;
 }
 
 // -------------------------------
@@ -522,7 +531,6 @@ async function crawlSite(
 
   async function handlePage(target: URL, depth: number, parent?: string) {
     if (depth > opts.maxDepth) return;
-
     if (!sameHost(target, baseHost, includeSubdomains)) return;
     if (!isLikelyHtml(target)) return;
     if (shouldSkipPath(target)) return;
@@ -577,7 +585,7 @@ async function crawlSite(
 
     const html = res.body.toString("utf8");
 
-    // Canonical
+    // Canonical handling (merge under canonical key)
     const canon = getCanonicalFromHtml(html, finalUrl);
     if (canon) {
       try {
@@ -646,31 +654,19 @@ async function crawlSite(
     );
   }
 
-  // Prepare rows (only url + path)
-const rows: Row[] = [];
-for (const [, info] of pageMap) {
-  rows.push({
-    url: info.url,
-    path: new URL(info.url).pathname || "/"
-  });
-}
-
-// NEW: order parent-first, then children
-return hierarchicalOrder(rows);
-}
-
-function getCanonicalFromHtml(html: string, baseUrl: URL): string | null {
-  const m = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*>/i);
-  if (!m) return null;
-  const tag = m[0];
-  const hrefM = tag.match(/\shref=["']([^"']+)["']/i);
-  if (!hrefM) return null;
-  try {
-    const u = new URL(hrefM[1], baseUrl);
-    return u.toString();
-  } catch {
-    return null;
+  // Build internal rows (url + path), order them parent-first, then convert to hyperlink-only path
+  const internal: InternalRow[] = [];
+  for (const [, info] of pageMap) {
+    const path = new URL(info.url).pathname || "/";
+    internal.push({ url: info.url, path });
   }
+  const ordered = hierarchicalOrder(internal);
+
+  const rows: Row[] = ordered.map(r => ({
+    path: hyperlinkFormula(seedRoot, normalizeForGrouping(r.path))
+  }));
+
+  return rows;
 }
 
 // -------------------------------
@@ -696,6 +692,7 @@ app.post("/crawl", async (req: Request, res: Response) => {
       ...DEFAULTS,
       ...o
     });
+    // Return a root-level array of single-column objects
     return res.status(200).json(rows);
   } catch (e: any) {
     return res.status(500).json({ error: String(e?.message || e) });
