@@ -1,11 +1,9 @@
-// src/server.ts
 import express, { Request, Response } from "express";
 import { request } from "undici";
 import * as zlib from "node:zlib";
 import { URL } from "node:url";
 import { XMLParser } from "fast-xml-parser";
 import pLimit from "p-limit";
-import { createHash } from "node:crypto";
 import { promises as dns } from "node:dns";
 import net from "node:net";
 
@@ -30,10 +28,6 @@ type CrawlOptions = {
 type Row = {
   url: string;
   path: string;
-  title: string | null;
-  is_orphan: boolean;
-  noindex: boolean;
-  nofollow: boolean;
 };
 
 type PageInfo = {
@@ -43,9 +37,9 @@ type PageInfo = {
   discoveredVia: Set<"sitemap" | "crawl" | "guess">;
   status?: number;
   contentType?: string | null;
-  title?: string | null;
-  noindex?: boolean;
-  nofollow?: boolean;
+  title?: string | null;          // kept in type (not used in output)
+  noindex?: boolean;              // kept in type (not used in output)
+  nofollow?: boolean;             // kept in type (not used in output)
   canonical?: string | null;
   lastmod?: string | null;
   sourceSitemaps?: Set<string>;
@@ -184,7 +178,7 @@ const SKIP_PATH_PATTERNS: RegExp[] = [
 
   // Custom exclusions
   /^\/wpa-stats-type(?:\/|$)/i,
-  /\.kml$/i // exclude .kml files by pathname
+  /\.kml$/i // pathname ends with .kml
 ];
 
 function shouldSkipPath(u: URL): boolean {
@@ -205,10 +199,6 @@ function canonicalKey(u: URL): string {
   copy.host = copy.hostname.toLowerCase() + (copy.port ? `:${copy.port}` : "");
   const key = `${copy.protocol}//${copy.host}${copy.pathname}${copy.search}`;
   return key;
-}
-
-function sha1(s: string): string {
-  return createHash("sha1").update(s).digest("hex");
 }
 
 async function httpGet(
@@ -420,56 +410,6 @@ async function harvestSitemaps(
   return { pages, usedSitemaps };
 }
 
-function extractMetaRobots(content: string): { noindex: boolean; nofollow: boolean } {
-  const m = content.toLowerCase();
-  const noindex = /\bnoindex\b/.test(m);
-  const nofollow = /\bnofollow\b/.test(m);
-  return { noindex, nofollow };
-}
-
-function getTitleFromHtml(html: string): string | null {
-  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (!m) return null;
-  return decodeHTMLEntities(m[1].trim());
-}
-
-function decodeHTMLEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-function getCanonicalFromHtml(html: string, baseUrl: URL): string | null {
-  const m = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*>/i);
-  if (!m) return null;
-  const tag = m[0];
-  const hrefM = tag.match(/\shref=["']([^"']+)["']/i);
-  if (!hrefM) return null;
-  try {
-    const u = new URL(hrefM[1], baseUrl);
-    return u.toString();
-  } catch {
-    return null;
-  }
-}
-
-function extractMetaRobotsFromHtml(html: string): { noindex: boolean; nofollow: boolean } {
-  let noindex = false, nofollow = false;
-  const tags = html.match(/<meta\s+[^>]*name=["']robots["'][^>]*>/ig) || [];
-  for (const tag of tags) {
-    const contentM = tag.match(/\scontent=["']([^"']+)["']/i);
-    if (contentM) {
-      const r = extractMetaRobots(contentM[1]);
-      noindex = noindex || r.noindex;
-      nofollow = nofollow || r.nofollow;
-    }
-  }
-  return { noindex, nofollow };
-}
-
 // -------------------------------
 // Crawl
 // -------------------------------
@@ -558,8 +498,7 @@ async function crawlSite(
 
     const html = res.body.toString("utf8");
 
-    info.title = getTitleFromHtml(html);
-
+    // Canonical
     const canon = getCanonicalFromHtml(html, finalUrl);
     if (canon) {
       try {
@@ -584,12 +523,6 @@ async function crawlSite(
             };
             existing.parents = new Set<string>([...existing.parents, ...info.parents]);
             info.discoveredVia.forEach(d => existing.discoveredVia.add(d));
-            if (info.title && !existing.title) existing.title = info.title;
-            if (info.status && !existing.status) existing.status = info.status;
-            if (info.contentType && !existing.contentType) existing.contentType = info.contentType;
-            existing.noindex = existing.noindex || info.noindex || false;
-            existing.nofollow = existing.nofollow || info.nofollow || false;
-            if (info.sourceSitemaps) info.sourceSitemaps.forEach(s => existing.sourceSitemaps?.add(s));
             pageMap.set(ck, existing);
             pageMap.delete(key);
           }
@@ -597,10 +530,7 @@ async function crawlSite(
       } catch { /* ignore bad canonical */ }
     }
 
-    const meta = extractMetaRobotsFromHtml(html);
-    info.noindex = !!meta.noindex;
-    info.nofollow = !!meta.nofollow;
-
+    // Extract links (lightweight)
     const hrefs: string[] = [];
     const anchorRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>/ig;
     let m: RegExpExecArray | null;
@@ -637,28 +567,30 @@ async function crawlSite(
     );
   }
 
-  // Compute inbound counts (for orphan calc)
-  const inbound = new Map<string, number>();
-  for (const [key, info] of pageMap) {
-    inbound.set(key, info.parents.size);
-  }
-
-  // Prepare rows (slimmed)
+  // Prepare rows (only url + path)
   const rows: Row[] = [];
-  for (const [key, info] of pageMap) {
-    const isOrphan = info.discoveredVia.has("sitemap") && (inbound.get(key) || 0) === 0;
-
+  for (const [, info] of pageMap) {
     rows.push({
       url: info.url,
-      path: new URL(info.url).pathname || "/",
-      title: info.title ?? null,
-      is_orphan: isOrphan,
-      noindex: !!info.noindex,
-      nofollow: !!info.nofollow
+      path: new URL(info.url).pathname || "/"
     });
   }
 
   return rows;
+}
+
+function getCanonicalFromHtml(html: string, baseUrl: URL): string | null {
+  const m = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*>/i);
+  if (!m) return null;
+  const tag = m[0];
+  const hrefM = tag.match(/\shref=["']([^"']+)["']/i);
+  if (!hrefM) return null;
+  try {
+    const u = new URL(hrefM[1], baseUrl);
+    return u.toString();
+  } catch {
+    return null;
+  }
 }
 
 // -------------------------------
