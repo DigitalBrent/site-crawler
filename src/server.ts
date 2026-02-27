@@ -29,7 +29,6 @@ type CrawlOptions = {
 // Final row returned to Sheets: only one column
 type Row = {
   path: string; // a Google Sheets HYPERLINK() formula whose display text is the relative path
-  inbound_count: number;
 };
 
 type PageInfo = {
